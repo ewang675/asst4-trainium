@@ -69,7 +69,7 @@ def vector_add_tiled(a_vec, b_vec):
     M = a_vec.shape[0]
     
     # TODO: You should modify this variable for Step 1
-    ROW_CHUNK = 1
+    ROW_CHUNK = 256
 
     # Loop over the total number of chunks, we can use affine_range
     # because there are no loop-carried dependencies
@@ -99,15 +99,17 @@ elements per DMA transfer.
 """
 @nki.jit
 def vector_add_stream(a_vec, b_vec):
+    # Set maximum free dim size
+    FREE_DIM_MAX = 64000; 
 
     # Get the total number of vector rows
     M = a_vec.shape[0]
 
-    # TODO: You should modify this variable for Step 1
-    FREE_DIM = 2
-
     # The maximum size of our Partition Dimension
     PARTITION_DIM = 128
+
+    # TODO: You should modify this variable for Step 1
+    FREE_DIM = min(FREE_DIM_MAX, M // PARTITION_DIM)
 
     # The total size of each tile
     TILE_M = PARTITION_DIM * FREE_DIM
