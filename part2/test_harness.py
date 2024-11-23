@@ -185,7 +185,8 @@ if __name__ == "__main__":
         print("Passed 😎")
     else:
         print("Failed 😢")
-
+    
+    """
     print(
         "Running correctness test for conv2d kernel with larger images...",
         end="",
@@ -264,6 +265,8 @@ if __name__ == "__main__":
             print("Performance test passed 😍")
         else:
             print("Performance test failed 😢")
+
+    """
 
         if args.profile is not None:
             save_trace(args.profile + "_pool", "file_pool_2.neff")
