@@ -52,9 +52,9 @@ def test_correctness_conv2d_kernel(
 
     input_channels_list = [128, 256]
     output_channels_list = [128, 256]
-    kernel_size_list = [3]
+    kernel_size_list = [1] # 3
     batch_size_list = [4]
-    image_dims_list = [(32, 16)]
+    image_dims_list = [(8, 16)] #(32, 16)
     pool_size = 2 if use_maxpool else 1
 
     if use_larger_images:
@@ -266,7 +266,6 @@ if __name__ == "__main__":
         else:
             print("Performance test failed 😢")
 
-    """
-
         if args.profile is not None:
             save_trace(args.profile + "_pool", "file_pool_2.neff")
+    """

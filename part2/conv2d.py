@@ -6,35 +6,6 @@ import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 from neuronxcc.nki import baremetal
 
-def shift(input_tensor, shift_amount):
-    """
-    Shifts the input tensor spatially by the given shift amount.
-
-    Args:
-        input_tensor (ndarray): The input tensor of shape (height, width, channels).
-        shift_amount (tuple): Tuple (i, j) indicating the number of rows and columns to shift.
-    
-    Returns:
-        ndarray: The shifted tensor, padded with zeros.
-    """
-    i, j = shift_amount
-    h, w, c = input_tensor.shape
-    
-    # Create an output tensor filled with zeros
-    shifted_tensor = np.zeros_like(input_tensor)
-    
-    # Compute valid slicing ranges
-    start_row, end_row = max(0, i), min(h, h + i)
-    start_col, end_col = max(0, j), min(w, w + j)
-    
-    src_start_row, src_end_row = max(0, -i), min(h, h - i)
-    src_start_col, src_end_col = max(0, -j), min(w, w - j)
-    
-    # Copy valid region into the shifted tensor
-    shifted_tensor[start_row:end_row, start_col:end_col, :] = input_tensor[src_start_row:src_end_row, src_start_col:src_end_col, :]
-    
-    return shifted_tensor
-
 """
 A fused convolution - maxpool kernel that you need to implement for Part 2.
 
@@ -92,6 +63,9 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         buffer=nl.hbm,
     )
 
+    out_size = out_pool_height * out_pool_width
+    filter_size = filter_height * filter_width
+
     # Various tiling dimensions (You may want to define more of them)
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
@@ -101,32 +75,73 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         # TODO: Perform the convolution of X[b] with the weights W and bias b, followed by a maxpool
         # and store the result in X_out[b]
 
-        FREE_DIM = 1000
-        PARTITION_DIM = 128
-        TILE_M = PARTITION_DIM * FREE_DIM * in_channels
-        M = input_height * input_width
+        # ASSUMING FOR NOW that everything fits in SBUF.
 
-        # Allocate space for X in HBM.
-        X_b = nl.ndarray((M // TILE_M, in_channels, PARTITION_DIM, FREE_DIM), dtype=X.dtype, buffer=nl.hbm)
-
-        # Load X[b] in.
-        X_b = nl.load(X[b])
-
-        for m in nl.affine_range((M // TILE_M)):
-            # Load in this tile
-            X_b_tile = nl.ndarray((in_channels, PARTITION_DIM, FREE_DIM), dtype=X_b.dtype, buffer=nl.sbuf)
-            X_b_tile = nl.load(X_b[m])
-            
-            res = np.zeros(out_channels, PARTITION_DIM, FREE_DIM)
-
-            for i in range(filter_height):
-                for j in range(filter_width):
-                    input_shifted = shift(X_b_tile, (i, j))
-                    res += matmul(input_shifted, W[i, j, :, :])
+        # for i in range((input_height * input_width) // (filter_height * filter_width)):
         
-        res += bias
+        # Construct A.
+        A = nl.ndarray((filter_size * in_channels, out_size), dtype=X.dtype, buffer=nl.hbm)
+        print(A.shape)
+        for i in range(out_pool_height):
+            for j in range(out_pool_width):
+                p = i * out_pool_width + j
+                temp_buf = nl.ndarray((in_channels, filter_height, filter_width), dtype=X.dtype, buffer=nl.sbuf)
+                temp_buf[...] = nl.load(X[b, :, i:(i + filter_height), j:(j + filter_width)])
+                nl.store(A[:, p], value=temp_buf.reshape((filter_size * in_channels,)))
 
-        nl.store(X_out[b], value=out_b)
+        # Construct B.
+        B = nl.ndarray((filter_size * in_channels, out_channels), dtype=X.dtype, buffer=nl.hbm)
+        temp_buf = nl.ndarray((filter_size * in_channels, out_channels), dtype=X.dtype, buffer=nl.sbuf)
+        temp_buf[...] = nl.load(W.reshape((filter_size * in_channels, out_channels)))
+        nl.store(B, value=temp_buf)
+        print(B.shape)
+        
+        # MATMUL, copied from assignment spec
+        # Construct C. 
+        C = nl.ndarray((out_size, out_channels), dtype=X_out.dtype, buffer=nl.hbm)
+        print(C.shape)
+
+        K, M = A.shape
+        K_, N = B.shape
+        assert K == K_, "lhsT and rhs must have the same contraction dimension"
+
+        # Maximum free dimension of the stationary operand of general matrix multiplication on tensor engine
+        TILE_M = min(M, nl.tile_size.gemm_stationary_fmax)  # 128
+
+        # Maximum partition dimension of a tile
+        TILE_K = min(K, nl.tile_size.pmax)  # 128
+
+        # Maximum free dimension of the moving operand of general matrix multiplication on tensor engine
+        TILE_N = min(N, nl.tile_size.gemm_moving_fmax)  # 512
+
+        # Use affine_range to loop over tiles
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                print("hello!\n")
+                # Allocate a tensor in PSUM
+                res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
+
+                for k in nl.affine_range(K // TILE_K):
+                    # Declare the tiles on SBUF
+                    A_tile = nl.ndarray((TILE_K, TILE_M), dtype=A.dtype, buffer=nl.sbuf)
+                    B_tile = nl.ndarray((TILE_K, TILE_N), dtype=B.dtype, buffer=nl.sbuf)
+
+                    # Load tiles from lhsT and rhs
+                    A_tile[...] = nl.load(A[k * TILE_K:(k + 1) * TILE_K,
+                                                m * TILE_M:(m + 1) * TILE_M])
+                    B_tile[...] = nl.load(B[k * TILE_K:(k + 1) * TILE_K,
+                                                n * TILE_N:(n + 1) * TILE_N])
+
+                    # Accumulate partial-sums into PSUM
+                    res_psum += nl.matmul(A_tile[...], B_tile[...], transpose_x=True)
+
+                # Copy the result from PSUM back to SBUF, and cast to expected output data-type
+                res_sb = nl.copy(res_psum, dtype=C.dtype)
+                nl.store(C[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
+                        value=res_sb)
+        
+        temp_buf_ = nl.ndarray((out_channels, out_pool_height, out_pool_width), dtype=X_out.dtype, buffer=nl.sbuf)
+        temp_buf_[...] = nl.load(C.reshape((out_channels, out_pool_height, out_pool_width)))
+        nl.store(X_out[b], value=temp_buf_)
 
     return X_out
-
