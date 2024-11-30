@@ -92,24 +92,25 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         for m in nl.affine_range(n_tiles_hw):
             for n in nl.affine_range(n_tiles_c_out):
                 conv_result = nl.zeros((TILE_C_OUT, TILE_H * out_width), nl.float32, buffer=nl.psum)
-                for h in nl.affine_range(TILE_H):
-                    true_h = m * TILE_H + h
-                    for i in nl.affine_range(filter_height):
-                        for j in nl.affine_range(filter_width):
-                            # Matrix multiplication
-                            res_psum = nl.zeros((TILE_C_OUT, out_width), nl.float32, buffer=nl.psum)
-                            for k in nl.affine_range(n_tiles_c_in):
-                                # Declare the tiles on SBUF
-                                lhsT_tile = nl.ndarray((TILE_C_IN, TILE_C_OUT), dtype=W.dtype, buffer=nl.sbuf)
-                                rhs_tile = nl.ndarray((TILE_C_IN, out_width), dtype=X.dtype, buffer=nl.sbuf)
+                for i in nl.affine_range(filter_height):
+                    for j in nl.affine_range(filter_width):
+                        # Matrix multiplication    
+                        for k in nl.affine_range(n_tiles_c_in):
+                            # Declare the tiles on SBUF
+                            lhsT_tile = nl.ndarray((TILE_C_IN, TILE_C_OUT), dtype=W.dtype, buffer=nl.sbuf)
+                            for l in nl.affine_range(TILE_C_OUT):
+                                lhsT_tile[:, l] = nl.load(W[n * TILE_C_OUT + l, k * TILE_C_IN:(k + 1) * TILE_C_IN, i, j])
+                            rhs_tile = nl.ndarray((TILE_C_IN, TILE_H * out_width), dtype=X.dtype, buffer=nl.sbuf)
+                            for h in nl.affine_range(TILE_H):
+                                true_h = m * TILE_H + h
+                                rhs_tile[:, h*out_width:(h+1)*out_width] = nl.load(X[b, k * TILE_C_IN:(k + 1) * TILE_C_IN, true_h + i, j:j+out_width])
                                 
-                                for l in nl.affine_range(TILE_C_OUT):
-                                    lhsT_tile[:, l] = nl.load(W[n * TILE_C_OUT + l, k * TILE_C_IN:(k + 1) * TILE_C_IN, i, j])
-                                rhs_tile[...] = nl.load(X[b, k * TILE_C_IN:(k + 1) * TILE_C_IN, true_h + i, j:j+out_width])
-
-                                # Accumulate partial-sums into PSUM
-                                res_psum += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
-                            conv_result[:,h*out_width:(h+1)*out_width] += res_psum
+                            # Accumulate partial-sums into PSUM
+                            conv_result += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
+                bias_tile = nl.ndarray((TILE_C_OUT, TILE_H * out_width), dtype=bias.dtype, buffer=nl.sbuf)
+                for hw in nl.affine_range(TILE_H * out_width):
+                    bias_tile[:, hw] = nl.load(bias[n * TILE_C_OUT:(n + 1) * TILE_C_OUT])
+                conv_result += bias_tile
 
                 # nl.device_print("conv_result", conv_result)
                 # Note that we will need to ignore all hw in TILE_HW with w >= out_width and h >= out_height
