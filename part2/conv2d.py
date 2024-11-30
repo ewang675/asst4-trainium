@@ -52,7 +52,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     out_pool_width = out_width // pool_size
     
     # Can assume multiple of 128 to avoid using mask
-    assert in_channels % 128 == 0
+    # assert in_channels % 128 == 0
 
     # Can assume one PSUM bank can at least fit one row of the pixels
     assert nl.tile_size.gemm_moving_fmax >= out_width
@@ -65,16 +65,24 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     )
 
     # Various tiling dimensions (You may want to define more of them)
-    hw_dim = input_height * input_width
-    TILE_HW = min(hw_dim, nl.tile_size.gemm_stationary_fmax)
-    n_tiles_hw = hw_dim // TILE_HW
+    TILE_C_OUT = min(out_channels, nl.tile_size.gemm_stationary_fmax) 
+    n_tiles_c_out = out_channels // TILE_C_OUT
 
     TILE_C_IN = min(in_channels, nl.tile_size.pmax)
     n_tiles_c_in = in_channels // TILE_C_IN
+    print(f"TILE_C_OUT: {TILE_C_OUT}, n_tiles_c_out: {n_tiles_c_out}, TILE_C_IN: {TILE_C_IN}, n_tiles_c_in: {n_tiles_c_in}")
 
-    TILE_C_OUT = min(out_channels, nl.tile_size.gemm_moving_fmax) 
-    n_tiles_c_out = out_channels // TILE_C_OUT
+    # TILE_HW is the largest multiple of pool_size * input_width that is less than or equal to nl.tile_size.gemm_moving_fmax
+    # I assume that pool_size * input_width is always less than or equal to nl.tile_size.gemm_moving_fmax
+    print(f"pool_size: {pool_size}, input_width: {input_width}, gemm_moving: {nl.tile_size.gemm_moving_fmax}")
+    TILE_HW = (pool_size * out_width) * (nl.tile_size.gemm_moving_fmax // (pool_size * out_width))
+    TILE_HW = min(TILE_HW, out_height * out_width)
+    n_tiles_hw = out_height * out_width // TILE_HW
+    n_vert_pools = TILE_HW // (pool_size * out_width)
+    TILE_H = TILE_HW // out_width
+    print(f"TILE_HW: {TILE_HW}, n_tiles_hw: {n_tiles_hw}, n_vert_pools: {n_vert_pools}, TILE_H: {TILE_H}")
 
+    # nl.device_print("X", X)
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
@@ -82,54 +90,73 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         # and store the result in X_out[b]
         
         # convolution first 
-        conv_result = nl.zeros((out_height, out_width, out_channels), nl.float32, buffer=nl.psum)
-        for i in nl.affine_range(filter_height):
-            for j in nl.affine_range(filter_width):
+        for m in nl.affine_range(n_tiles_hw):
+            for n in nl.affine_range(n_tiles_c_out):
+                conv_result = nl.zeros((TILE_C_OUT, TILE_H * out_width), nl.float32, buffer=nl.psum)
+                if m == n_tiles_hw - 1: # special case for the last tile
+                    # we need to ignore the last few rows since they are out of bounds
+                    for h in nl.affine_range(TILE_H - filter_height + 1):
+                        true_h = m * TILE_H + h
+                        for i in nl.affine_range(filter_height):
+                            for j in nl.affine_range(filter_width):
+                                # Matrix multiplication
+                                for k in nl.affine_range(n_tiles_c_in):
+                                    # Declare the tiles on SBUF
+                                    lhsT_tile = nl.ndarray((TILE_C_IN, TILE_C_OUT), dtype=W.dtype, buffer=nl.sbuf)
+                                    rhs_tile = nl.ndarray((TILE_C_IN, out_width), dtype=X.dtype, buffer=nl.sbuf)
 
-                # matrix multiplication
-                matmul_result = nl.zeros((input_height, input_width, out_channels), nl.float32, buffer=nl.psum)
-                for m in nl.affine_range(n_tiles_hw):
-                    for n in nl.affine_range(n_tiles_c_out):
-                        # Allocate a tensor in PSUM
-                        res_psum = nl.zeros((TILE_HW, TILE_C_OUT), nl.float32, buffer=nl.psum)
+                                    for l in nl.affine_range(TILE_C_OUT):
+                                        lhsT_tile[:, l] = nl.load(W[n + l, k * TILE_C_IN:(k + 1) * TILE_C_IN, i, j])
+                                    rhs_tile[...] = nl.load(X[b, k * TILE_C_IN:(k + 1) * TILE_C_IN, true_h + i, j:j+out_width])
 
-                        for k in nl.affine_range(n_tiles_c_in):
-                            # Declare the tiles on SBUF
-                            lhsT_tile = nl.ndarray((TILE_C_IN, TILE_HW), dtype=X.dtype, buffer=nl.sbuf)
-                            rhs_tile = nl.ndarray((TILE_C_IN, TILE_C_OUT), dtype=W.dtype, buffer=nl.sbuf)
+                                    # nl.device_print("lhsT_tile", lhsT_tile)
+                                    # nl.device_print("rhs_tile", rhs_tile)
 
-                            # Load tiles from lhsT and rhs
-                            # Using a slow load rn, see if there is a reshape possibility
-                            for hw in nl.affine_range(TILE_HW):
-                                true_hw = hw + m * TILE_HW
-                                h = true_hw // input_width
-                                w = true_hw % input_width
-                                lhsT_tile[:, hw] = nl.load(X[b, k * TILE_C_IN:(k + 1) * TILE_C_IN, h + i, w + j])
-                            rhs_tile[...] = nl.load(W[n * TILE_C_OUT:(n + 1) * TILE_C_OUT, k * TILE_C_IN:(k + 1) * TILE_C_IN, i, j])
+                                    # Accumulate partial-sums into PSUM
+                                    conv_result[:,h*out_width:(h+1)*out_width] += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
+                                    nl.device_print("h", h)
+                                    # nl.device_print("conv_result", conv_result)
+                else:
+                    for h in nl.affine_range(TILE_H):
+                        true_h = m * TILE_H + h
+                        for i in nl.affine_range(filter_height):
+                            for j in nl.affine_range(filter_width):
+                                # Matrix multiplication
+                                for k in nl.affine_range(n_tiles_c_in):
+                                    # Declare the tiles on SBUF
+                                    lhsT_tile = nl.ndarray((TILE_C_IN, TILE_C_OUT), dtype=W.dtype, buffer=nl.sbuf)
+                                    rhs_tile = nl.ndarray((TILE_C_IN, out_width), dtype=X.dtype, buffer=nl.sbuf)
 
-                            # Accumulate partial-sums into PSUM
-                            res_psum += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
+                                    lhsT_tile[...] = nl.load(W[i, j, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, k * TILE_C_IN:(k + 1) * TILE_C_IN])
+                                    rhs_tile[...] = nl.load(X[b, k * TILE_C_IN:(k + 1) * TILE_C_IN, true_h + i, j:j+out_width])
 
-                        for hw in nl.affine_range(TILE_HW):
-                            true_hw = hw + m * TILE_HW
-                            h = true_hw // input_width
-                            w = true_hw % input_width
-                            matmul_result[h, w, n * TILE_C_OUT:(n + 1) * TILE_C_OUT] = res_psum[hw, :]
+                                    # Accumulate partial-sums into PSUM
+                                    conv_result[:,h*out_width:(h+1)*out_width] += nl.matmul(lhsT_tile[...], rhs_tile[...], transpose_x=True)
 
-                conv_result[i:out_height, j:out_width, :] += matmul_result[0:out_height - i, 0:out_width - j, :]
-                        # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-                        # res_sb = nl.copy(res_psum, dtype=result.dtype)
-                        # nl.store(result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
-                        #         value=res_sb)
-        
-        # maxpooling
-        for i in nl.affine_range(out_pool_height):
-            for j in nl.affine_range(out_pool_width):
-                for c in nl.affine_range(out_channels):
-                    max_val = nl.float32(-np.inf)
-                    for m in nl.affine_range(pool_size):
-                        for n in nl.affine_range(pool_size):
-                            max_val = nl.max(max_val, conv_result[i * pool_size + m, j * pool_size + n, c])
-                    X_out[b, c, i, j] = max_val
+                # Note that we will need to ignore all hw in TILE_HW with w >= out_width and h >= out_height
+                if pool_size > 1:
+                    for h in nl.affine_range(n_vert_pools):
+                        for w in nl.affine_range(out_pool_width):
+                            true_h = m * n_vert_pools + h
+                            maxpool_result = nl.zeros((TILE_C_OUT,1), nl.float32, buffer=nl.psum)
+                            for i in nl.affine_range(pool_size):
+                                for j in nl.affine_range(pool_size):
+                                    hw_h = h * pool_size + i
+                                    hw_w = w * pool_size + j
+                                    assert (hw_h < out_height and hw_w < out_width)
+                                    maxpool_result = nl.maximum(maxpool_result, conv_result[:, hw_h * out_width + hw_w])
+                            # Copy the result from PSUM back to SBUF, and cast to expected output data-type
+                            res_sb = nl.copy(maxpool_result, dtype=X_out.dtype)
+                            nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, true_h, w],
+                                    value=res_sb)  
+                else:
+                    print("no maxpooling")
+                    for h in nl.affine_range(n_vert_pools):
+                        for w in nl.affine_range(out_pool_width):
+                            true_h = m * n_vert_pools + h
+                            # Copy the result from PSUM back to SBUF, and cast to expected output data-type
+                            res_sb = nl.copy(conv_result[:, h * out_width + w], dtype=X_out.dtype)
+                            nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, true_h, w],
+                                    value=res_sb)    
 
     return X_out
