@@ -102,11 +102,22 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     S_TILE_H = n_conv_rows + (filter_height - 1) # number of rows of input per s_tile
     S_TILE_HW = S_TILE_H * input_width * n_tiles_c_in # real size of FREE_DIM
     n_tiles_s_in = out_height // (TILE_H * n_tiles_hw)
+    # print(f"n_tiles_s_in: {n_tiles_s_in}, n_vert_pools: {n_vert_pools}, n_tiles_hw: {n_tiles_hw} in_channels: {in_channels}, n_tiles_c_in: {n_tiles_c_in}, S_TILE_H: {S_TILE_H}, S_TILE_HW: {S_TILE_HW}, n_conv_rows: {n_conv_rows}, n_tiles_hw: {n_tiles_hw}, TILE_H: {TILE_H}, filter_height: {filter_height}")
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
         # TODO: Perform the convolution of X[b] with the weights W and bias b, followed by a maxpool
         # and store the result in X_out[b]
+
+        # first load bias and weights into SBUF to reduce redundant loads later on
+        bias_tiles = nl.ndarray((TILE_C_OUT, n_tiles_c_out), dtype=bias.dtype, buffer=nl.sbuf)
+        for n in nl.affine_range(n_tiles_c_out):
+            bias_tiles[:, n] = nl.load(bias[n * TILE_C_OUT:(n + 1) * TILE_C_OUT])
+        # Assume that (in_channels * filter_height * filter_width) < MAX_FREE_DIM
+        weight_tiles = nl.ndarray((n_tiles_c_in, nl.par_dim(TILE_C_IN), out_channels, filter_height, filter_width), dtype=bias.dtype, buffer=nl.sbuf)
+        for k in nl.affine_range(n_tiles_c_in):
+            for l in nl.affine_range(out_channels):
+                weight_tiles[k, :, l, :, :] = nl.load(W[l, k * TILE_C_IN:(k + 1) * TILE_C_IN, :, :])
         
         # convolution first 
         for s in nl.affine_range(n_tiles_s_in):
@@ -115,15 +126,14 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             for k in nl.affine_range(n_tiles_c_in):
                 s_input[k, :, :, :] = nl.load(X[b, k * TILE_C_IN:(k + 1) * TILE_C_IN, s * n_conv_rows:(s * n_conv_rows + S_TILE_H), :])
             for n in nl.affine_range(n_tiles_c_out):
-                # can move this outside the loop.
-                bias_tile = nl.ndarray((TILE_C_OUT,1,1), dtype=bias.dtype, buffer=nl.sbuf)
-                bias_tile[...] = nl.load(bias[n * TILE_C_OUT:(n + 1) * TILE_C_OUT])
-                broadcasted_bias = bias_tile.broadcast_to((TILE_C_OUT, n_vert_pools, out_pool_width))
-                # load in weight tile: can move this outside of loop.
+                # copy in bias tile
+                bias_ = nl.ndarray((TILE_C_OUT,1,1), dtype=bias.dtype, buffer=nl.sbuf)
+                bias_[...] = nl.copy(bias_tiles[:, n])
+                broadcasted_bias = bias_.broadcast_to((TILE_C_OUT, n_vert_pools, out_pool_width))
+                # copy in weight tile
                 weight_ = nl.ndarray((n_tiles_c_in, nl.par_dim(TILE_C_IN), TILE_C_OUT, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
                 for k in nl.affine_range(n_tiles_c_in):
-                    for l in nl.affine_range(TILE_C_OUT):
-                        weight_[k, :, l, :, :] = nl.load(W[n * TILE_C_OUT + l, k * TILE_C_IN:(k + 1) * TILE_C_IN, :, :])
+                    weight_[k, :, :, :, :] = nl.copy(weight_tiles[k, :, n * TILE_C_OUT:(n + 1) * TILE_C_IN, :, :])
                 for m in nl.affine_range(n_tiles_hw):
                     conv_result = nl.zeros((TILE_C_OUT, TILE_H * out_width), dtype=X_out.dtype, buffer=nl.sbuf)
                     # copy in input tile
@@ -154,7 +164,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         i_4 = nl.arange(pool_size)[None, None, None, None, :]
                         out_tile = nl.max(conv_result[i_0, (i_1 * pool_size + i_2) * out_width + i_3 * pool_size + i_4], axis=[2, 4])
                         out_tile += broadcasted_bias
-                        tile_idx * TILE_H, (tile_dx + 1) * TILE_H
+                        tile_idx = n_tiles_hw * s + m
                         nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, tile_idx * TILE_H:(tile_idx + 1) * TILE_H, :], value=out_tile)
                     else:
                         # print("no maxpooling, assume out_pool_width = out_width")
