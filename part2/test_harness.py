@@ -171,9 +171,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     np.random.seed(args.seed)
-
     if args.simulate:
         conv2d = simulate_kernel_wrapper(conv2d)
+
     # running correctness tests
     print(
         "Running correctness test for conv2d kernel with smaller images...",
@@ -246,7 +246,7 @@ if __name__ == "__main__":
 
     if args.profile is not None:
         save_trace(args.profile, "file_pool_1.neff")
-
+    
     if args.test_maxpool:
         print("Comparing performance with reference kernel (with maxpool, float32)...")
         test_result = test_performance_conv2d_kernel(conv2d, pool_size=2, dtype = np.float32)

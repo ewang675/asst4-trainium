@@ -156,24 +156,30 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             # Copy the result from PSUM back to SBUF, and cast to expected output data-type
                             conv_result += nl.copy(res_psum, dtype=X_out.dtype)
 
+                    # i_0 = nl.arange(TILE_C_OUT)[:, None, None]
+                    # i_1 = nl.arange(n_vert_pools)[None, :, None]
+                    # i_2 = nl.arange(out_pool_width)[None, None, :]
+                    conv_result_reshaped = nl.ndarray((TILE_C_OUT, TILE_H, out_width), dtype=X.dtype, buffer=nl.sbuf)
+                    for h in nl.affine_range(TILE_H):
+                        conv_result_reshaped[:, h, :] = conv_result[:, h * out_width:(h + 1) * out_width]
+
                     if pool_size > 1:
                         i_0 = nl.arange(TILE_C_OUT)[:, None, None, None, None]
                         i_1 = nl.arange(n_vert_pools)[None, :, None, None, None]
                         i_2 = nl.arange(pool_size)[None, None, :, None, None]
                         i_3 = nl.arange(out_pool_width)[None, None, None, :, None]
                         i_4 = nl.arange(pool_size)[None, None, None, None, :]
-                        out_tile = nl.max(conv_result[i_0, (i_1 * pool_size + i_2) * out_width + i_3 * pool_size + i_4], axis=[2, 4])
+                        # out_tile = nl.max(conv_result_reshaped[i_0, pool_size * i_1 + i_2, pool_size * i_3 + i_4], axis=[2, 4])
+                        out_tile = nl.max(conv_result_reshaped[i_0, pool_size * i_1 + i_2, pool_size * i_3 + i_4], axis=[2, 4])
                         out_tile += broadcasted_bias
                         tile_idx = n_tiles_hw * s + m
-                        nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, tile_idx * TILE_H:(tile_idx + 1) * TILE_H, :], value=out_tile)
+                        nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, tile_idx * n_vert_pools:(tile_idx + 1) * n_vert_pools, :], value=out_tile)
                     else:
                         # print("no maxpooling, assume out_pool_width = out_width")
-                        i_0 = nl.arange(TILE_C_OUT)[:, None, None]
-                        i_1 = nl.arange(n_vert_pools)[None, :, None]
-                        i_2 = nl.arange(out_pool_width)[None, None, :]
-                        out_tile = conv_result[i_0, i_1 * out_pool_width + i_2]
-                        out_tile += broadcasted_bias
+                        out_tile = conv_result_reshaped + broadcasted_bias
                         tile_idx = n_tiles_hw * s + m
                         nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, tile_idx * TILE_H:(tile_idx + 1) * TILE_H, :], value=out_tile)
+
+
 
     return X_out
