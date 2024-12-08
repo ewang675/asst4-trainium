@@ -89,18 +89,18 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     S_TILE_HW = S_TILE_H * input_width * n_tiles_c_in
     n_tiles_s_in = out_height // (TILE_H * n_tiles_hw) # number of s_tiles per image
 
+    # bias fits entirely into sbuf
+    bias_tiles = nl.ndarray((TILE_C_OUT, n_tiles_c_out), dtype=bias.dtype, buffer=nl.sbuf)
+    for n in nl.affine_range(n_tiles_c_out):
+        bias_tiles[:, n] = nl.load(bias[n * TILE_C_OUT:(n + 1) * TILE_C_OUT])
+    # W fits entirely into sbuf
+    weight_tiles = nl.ndarray((n_tiles_c_in, nl.par_dim(TILE_C_IN), out_channels, filter_height, filter_width), dtype=bias.dtype, buffer=nl.sbuf)
+    for k in nl.affine_range(n_tiles_c_in):
+        for l in nl.affine_range(out_channels):
+            weight_tiles[k, :, l, :, :] = nl.load(W[l, k * TILE_C_IN:(k + 1) * TILE_C_IN, :, :])
+
     # process the images in batches
     for b in nl.affine_range(batch_size):
-
-        # bias fits entirely into sbuf
-        bias_tiles = nl.ndarray((TILE_C_OUT, n_tiles_c_out), dtype=bias.dtype, buffer=nl.sbuf)
-        for n in nl.affine_range(n_tiles_c_out):
-            bias_tiles[:, n] = nl.load(bias[n * TILE_C_OUT:(n + 1) * TILE_C_OUT])
-        # W fits entirely into sbuf
-        weight_tiles = nl.ndarray((n_tiles_c_in, nl.par_dim(TILE_C_IN), out_channels, filter_height, filter_width), dtype=bias.dtype, buffer=nl.sbuf)
-        for k in nl.affine_range(n_tiles_c_in):
-            for l in nl.affine_range(out_channels):
-                weight_tiles[k, :, l, :, :] = nl.load(W[l, k * TILE_C_IN:(k + 1) * TILE_C_IN, :, :])
         
         # process the image over s_tiles
         for s in nl.affine_range(n_tiles_s_in):
