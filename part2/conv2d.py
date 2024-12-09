@@ -114,7 +114,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 # copy in bias tile from SBUF
                 bias_ = nl.ndarray((TILE_C_OUT,1,1), dtype=bias.dtype, buffer=nl.sbuf)
                 bias_[...] = nl.copy(bias_tiles[:, n])
-                broadcasted_bias = bias_.broadcast_to((TILE_C_OUT, n_vert_pools, out_pool_width))
+                # broadcasted_bias = bias_.broadcast_to((TILE_C_OUT, n_vert_pools, out_pool_width))
                 # copy in weight tile from SBUF
                 weight_ = nl.ndarray((n_tiles_c_in, nl.par_dim(TILE_C_IN), TILE_C_OUT, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
                 for k in nl.affine_range(n_tiles_c_in):
@@ -157,12 +157,12 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         i_3 = nl.arange(out_pool_width)[None, None, None, :, None]
                         i_4 = nl.arange(pool_size)[None, None, None, None, :]
                         out_tile = nl.max(conv_result_reshaped[i_0, pool_size * i_1 + i_2, pool_size * i_3 + i_4], axis=[2, 4])
-                        out_tile = out_tile + broadcasted_bias
+                        out_tile = nisa.tensor_scalar(out_tile, nl.add, bias_)
                         tile_idx = n_tiles_hw * s + m
                         nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, tile_idx * n_vert_pools:(tile_idx + 1) * n_vert_pools, :], value=out_tile)
                     else:
                         # without maxpool
-                        out_tile = conv_result_reshaped + broadcasted_bias
+                        out_tile = nisa.tensor_scalar(conv_result_reshaped, nl.add, bias_)
                         tile_idx = n_tiles_hw * s + m
                         nl.store(X_out[b, n * TILE_C_OUT:(n + 1) * TILE_C_OUT, tile_idx * TILE_H:(tile_idx + 1) * TILE_H, :], value=out_tile)
 
